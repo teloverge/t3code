@@ -8,6 +8,10 @@ function canonicalizeWindowsDrivePath(path: string): string {
   return /^\/[A-Za-z]:\//.test(path) ? path.slice(1) : path;
 }
 
+function isWindowsAbsolutePath(path: string): boolean {
+  return /^[A-Za-z]:\//.test(path);
+}
+
 function trimTrailingPathSeparators(path: string): string {
   return path.replace(/[\\/]+$/, "");
 }
@@ -44,7 +48,7 @@ export function formatWorkspaceRelativePath(
     } else if (pathForCompare.startsWith(workspaceWithSeparator)) {
       const relativeSuffix = normalizedPath.slice(normalizedWorkspaceRoot.length + 1);
       displayPath = `${workspaceLabel}/${relativeSuffix}`;
-    } else if (!normalizedPath.startsWith("/")) {
+    } else if (!normalizedPath.startsWith("/") && !isWindowsAbsolutePath(normalizedPath)) {
       const relativePath = stripRelativePrefixes(normalizedPath);
       displayPath = pathForCompare.startsWith(workspaceLabelWithSeparator)
         ? normalizedPath

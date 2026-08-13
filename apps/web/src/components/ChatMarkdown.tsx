@@ -83,6 +83,7 @@ import {
 import { readLocalApi } from "../localApi";
 import { cn } from "../lib/utils";
 import { useRightPanelStore } from "../rightPanelStore";
+import { extractTerminalLinks } from "../terminal-links";
 import { useActiveEnvironmentId } from "../state/entities";
 import { serverEnvironment } from "../state/server";
 import { assetEnvironment } from "../state/assets";
@@ -160,9 +161,83 @@ const CHAT_MARKDOWN_SANITIZE_SCHEMA = {
   },
 } satisfies Parameters<typeof rehypeSanitize>[0];
 
+interface MarkdownHastNode {
+  readonly type?: string;
+  readonly tagName?: string;
+  readonly properties?: Record<string, unknown>;
+  readonly children?: ReadonlyArray<MarkdownHastNode>;
+}
+
+const WINDOWS_DRIVE_HREF_PATTERN = /^\/?[A-Za-z]:[\\/]/;
+
+function rehypeRewriteWindowsDriveFileHrefs() {
+  return (tree: MarkdownHastNode) => {
+    const visit = (node: MarkdownHastNode): void => {
+      if (node.tagName === "a" && node.properties) {
+        const href = node.properties.href;
+        if (typeof href === "string" && WINDOWS_DRIVE_HREF_PATTERN.test(href)) {
+          const drivePath = href.startsWith("/") ? href.slice(1) : href;
+          node.properties.href = `file:///${drivePath.replaceAll("\\", "/")}`;
+        }
+      }
+      node.children?.forEach(visit);
+    };
+
+    visit(tree);
+  };
+}
+
+const MARKDOWN_LINK_CONTAINER_TYPES = new Set(["link", "linkReference"]);
+
+function splitBareWindowsDrivePathText(value: string): MarkdownAstNode[] | null {
+  const matches = extractTerminalLinks(value).filter(
+    (match) => match.kind === "path" && WINDOWS_DRIVE_HREF_PATTERN.test(match.text),
+  );
+  if (matches.length === 0) return null;
+
+  const nodes: MarkdownAstNode[] = [];
+  let offset = 0;
+  for (const match of matches) {
+    if (match.start > offset) {
+      nodes.push({ type: "text", value: value.slice(offset, match.start) });
+    }
+    nodes.push({
+      type: "link",
+      url: match.text.replaceAll("\\", "/"),
+      children: [{ type: "text", value: match.text }],
+    });
+    offset = match.end;
+  }
+  if (offset < value.length) {
+    nodes.push({ type: "text", value: value.slice(offset) });
+  }
+  return nodes;
+}
+
+function remarkLinkBareWindowsDrivePaths() {
+  return (tree: MarkdownAstNode) => {
+    const visit = (node: MarkdownAstNode): void => {
+      if (MARKDOWN_LINK_CONTAINER_TYPES.has(node.type ?? "")) return;
+      const children = node.children;
+      if (!children) return;
+
+      node.children = children.flatMap((child) => {
+        if (child.type === "text" && typeof child.value === "string") {
+          return splitBareWindowsDrivePathText(child.value) ?? [child];
+        }
+        visit(child);
+        return [child];
+      });
+    };
+
+    visit(tree);
+  };
+}
+
 const CHAT_MARKDOWN_REMARK_PLUGINS = [
   remarkGfm,
   remarkGithubAlerts,
+  remarkLinkBareWindowsDrivePaths,
   remarkNormalizeListItemIndentation,
   remarkPreserveCodeMeta,
   remarkTagInlineCode,
@@ -171,6 +246,7 @@ const CHAT_MARKDOWN_REMARK_PLUGINS = [
 const CHAT_MARKDOWN_REMARK_PLUGINS_WITH_BREAKS = [
   remarkGfm,
   remarkGithubAlerts,
+  remarkLinkBareWindowsDrivePaths,
   remarkNormalizeListItemIndentation,
   remarkBreaks,
   remarkPreserveCodeMeta,
@@ -179,8 +255,13 @@ const CHAT_MARKDOWN_REMARK_PLUGINS_WITH_BREAKS = [
 
 const CHAT_MARKDOWN_REHYPE_PLUGINS = [
   rehypeRaw,
+  rehypeRewriteWindowsDriveFileHrefs,
   [rehypeSanitize, CHAT_MARKDOWN_SANITIZE_SCHEMA],
 ] satisfies NonNullable<ReactMarkdownOptions["rehypePlugins"]>;
+
+function transformChatMarkdownUrl(href: string): string {
+  return rewriteMarkdownFileUriHref(href) ?? defaultUrlTransform(href);
+}
 
 /** GitHub's own five alert kinds, in its colors: the glyph names the urgency, the title says it. */
 const GITHUB_ALERT_PRESENTATIONS: Record<
@@ -258,6 +339,8 @@ function extractPreCodeMeta(node: unknown): string | undefined {
 
 type MarkdownAstNode = {
   type?: string;
+  value?: string;
+  url?: string;
   meta?: unknown;
   data?: {
     hProperties?: Record<string, unknown>;
@@ -1376,9 +1459,7 @@ function ChatMarkdown({
     ];
     return buildFileLinkParentSuffixByPath(filePaths);
   }, [inlineCodeFileLinkMetaByText, markdownFileLinkMetaByHref]);
-  const markdownUrlTransform = useCallback((href: string) => {
-    return rewriteMarkdownFileUriHref(href) ?? defaultUrlTransform(href);
-  }, []);
+  const markdownUrlTransform = useCallback(transformChatMarkdownUrl, []);
   // Re-emit highlighted content as markdown so copying out of the rendered
   // view keeps links, emphasis, lists, and code fences intact.
   const handleCopy = useCallback((event: ReactClipboardEvent<HTMLDivElement>) => {
@@ -1544,7 +1625,10 @@ function ChatMarkdown({
       },
       a({ node, href, children, ...props }) {
         const normalizedHref = href ? normalizeMarkdownLinkHrefKey(href) : "";
-        const fileLinkMeta = normalizedHref ? markdownFileLinkMetaByHref.get(normalizedHref) : null;
+        const fileLinkMeta = normalizedHref
+          ? (markdownFileLinkMetaByHref.get(normalizedHref) ??
+            resolveMarkdownFileLinkMeta(normalizedHref, cwd))
+          : null;
         if (!fileLinkMeta) {
           const faviconHost = resolveExternalWebLinkHost(href);
           const isSameDocumentLink = href?.startsWith("#") ?? false;
